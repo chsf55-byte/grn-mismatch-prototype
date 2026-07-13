@@ -500,8 +500,6 @@
     operatorUser: 'Downtown Branch Operator'
   };
 
-  var reviewers = ['Finance Director', 'Accounts Manager'];
-
   function mkLine(id, item, cq, cp, rq, rp, opNote, resolution){
     return { id: id, item: item, confirmedQty: cq, confirmedPrice: cp, receivedQty: rq, receivedPrice: rp,
       opNote: opNote || '', resolution: resolution || null };
@@ -531,9 +529,9 @@
       lines: [
         mkLine('l1', 'Chicken breast', 100, 6.00, 100, 6.00, ''),
         mkLine('l2', 'Beef mince', 60, 8.50, 54, 8.50, 'Driver confirmed a short-load, said remainder isn\'t guaranteed for next batch.',
-          { type: 'credit_note', actor: 'Procurement Lead', ts: '2026-07-09 11:20', note: 'Real shortfall, not a rounding issue. Taking a credit rather than chasing redelivery for 6kg.', amount: 51.00, ref: 'CN-4471' }),
+          { type: 'settle_received', actor: 'Procurement Lead', ts: '2026-07-09 11:20', note: 'Real shortfall, not a rounding issue. Settling at what was received rather than chasing redelivery for 6kg.', settledQty: 54, settledTotal: 459.00 }),
         mkLine('l4', 'Fresh herbs bundle', 5, 3.00, 4.8, 3.00, 'Slight trim loss, herbs are always a bit inconsistent by weight.',
-          { type: 'accept', actor: 'Procurement Lead', ts: '2026-07-09 11:26', note: 'Within normal spoilage/trim variance for fresh herbs — not worth chasing for $0.60.' })
+          { type: 'settle_received', actor: 'Procurement Lead', ts: '2026-07-09 11:26', note: 'Within normal spoilage/trim variance for fresh herbs — not worth chasing for $0.60.', settledQty: 4.8, settledTotal: 14.40 })
       ]
     },
     {
@@ -541,7 +539,7 @@
       date: '2026-07-05', receivedBy: 'Downtown Branch Operator',
       lines: [
         mkLine('l1', 'Flour, 25kg bag', 20, 18.00, 20, 19.50, 'Supplier rep mentioned a fuel surcharge when dropping off.',
-          { type: 'escalate', actor: 'Procurement Lead', ts: '2026-07-06 09:40', note: 'Need to check whether our contract has a surcharge clause before agreeing to this. Passing to Finance.', to: 'Finance Director' })
+          { type: 'escalate', actor: 'Procurement Lead', ts: '2026-07-06 09:40', note: 'Need to check whether our contract has a surcharge clause before agreeing to this. Passing to the Accounts Manager to review the contract terms.', to: 'Accounts Manager' })
       ]
     },
     {
@@ -557,7 +555,7 @@
       lines: [
         mkLine('l1', 'Potatoes, russet', 100, 0.90, 99, 0.90, ''),
         mkLine('l2', 'Carrots', 40, 1.10, 40, 1.25, 'Supplier said prices went up this week, wasn\'t sure if it was agreed.',
-          { type: 'price_adjust', actor: 'Procurement Lead', ts: '2026-06-26 14:05', note: 'Called supplier — agreed to split the difference rather than pay the full increase.', newPrice: 1.15 })
+          { type: 'debit_credit', direction: 'credit', actor: 'Procurement Lead', ts: '2026-06-26 14:05', note: 'Called supplier — agreed to split the difference rather than pay the full increase. Credited $4 instead of the full $6 variance.', amount: 4.00, ref: 'CN-3382' })
       ]
     },
     {
@@ -565,7 +563,7 @@
       date: '2026-06-20', receivedBy: 'Downtown Branch Operator',
       lines: [
         mkLine('l1', 'Yogurt cups, 150g', 100, 0.80, 100, 0.95, 'Cashier-facing invoice showed a higher rate than what we normally pay.',
-          { type: 'price_adjust', actor: 'Procurement Lead', ts: '2026-06-21 10:12', note: 'Supplier confirmed their system had a stale price — agreed rate on file.', newPrice: 0.85 })
+          { type: 'debit_credit', direction: 'credit', actor: 'Procurement Lead', ts: '2026-06-21 10:12', note: 'Supplier confirmed their system had a stale price — agreed rate on file, credited the difference.', amount: 10.00, ref: 'CN-3105' })
       ]
     }
   ];
@@ -625,11 +623,43 @@
   function sevLabel(tier){ return { critical: 'Critical', medium: 'Medium', small: 'Small' }[tier]; }
   function sevTag(tier){ return '<span class="sev sev-' + tier + '">' + sevLabel(tier) + '</span>'; }
 
+  // ---------- Resolution actions ----------
+  // Which actions make sense depends on what actually varied: a pure quantity
+  // difference has an arithmetic answer (no typed-in number needed); a price
+  // difference is a real negotiation and stays manual. Over-delivery is the
+  // only case with two valid "keep vs. return" outcomes.
+  function hasQtyDelta(l){ return l.receivedQty !== l.confirmedQty; }
+  function hasPriceDelta(l){ return l.receivedPrice !== l.confirmedPrice; }
+  function isOverage(l){ return l.receivedQty > l.confirmedQty; }
+
+  function availableActions(l){
+    var actions = [];
+    if (hasQtyDelta(l)) actions.push('settle_received');
+    if (isOverage(l)) actions.push('return_surplus');
+    if (hasPriceDelta(l)) actions.push('debit_credit');
+    actions.push('escalate');
+    return actions;
+  }
+
+  function actionLabel(type){
+    return { settle_received: 'Settle at received qty', return_surplus: 'Return surplus', debit_credit: 'Debit/credit note', escalate: 'Escalate' }[type];
+  }
+
+  function resolutionLabel(res){
+    if (res.type === 'settle_received') return 'Settled at received quantity';
+    if (res.type === 'return_surplus') return 'Surplus returned';
+    if (res.type === 'debit_credit') return res.direction === 'credit' ? 'Credit note recorded' : 'Debit note recorded';
+    if (res.type === 'escalate') return 'Escalated';
+    return res.type;
+  }
+
   // ---------- Recovered value (the $ this feature actually saved) ----------
+  // Only counts genuine negotiated wins — a credit note. Settling at received
+  // or confirmed quantity is just correct arithmetic, not a recovered dollar,
+  // and a debit note is money going out, not back — neither belongs here.
   function recoveredValue(l){
     if (!l.resolution) return 0;
-    if (l.resolution.type === 'credit_note') return l.resolution.amount;
-    if (l.resolution.type === 'price_adjust') return (l.receivedPrice - l.resolution.newPrice) * l.receivedQty;
+    if (l.resolution.type === 'debit_credit' && l.resolution.direction === 'credit') return l.resolution.amount;
     return 0;
   }
 
@@ -729,7 +759,7 @@
         return {
           grnId: x.g.id, readOnly: true,
           title: x.g.id + ' · ' + x.l.item,
-          sub: resolutionLabel(x.l.resolution.type) + ' · ' + x.l.resolution.ts.split(' ')[0]
+          sub: resolutionLabel(x.l.resolution) + ' · ' + x.l.resolution.ts.split(' ')[0]
         };
       });
       badge.textContent = items.length;
@@ -816,10 +846,6 @@
     return '<div class="stat"><div class="stat-label">' + label + '</div><div class="stat-value ' + cls + '">' + value + '</div></div>';
   }
 
-  function resolutionLabel(type){
-    return { accept: 'Accepted as-is', price_adjust: 'Price adjusted', credit_note: 'Credit note recorded', escalate: 'Escalated' }[type] || type;
-  }
-
   function lineCompareBlock(l){
     var qv = qtyVariancePct(l), pv = priceVariancePct(l), dv = dollarImpact(l);
     var hasQty = Math.abs(qv) > 0.001, hasPrice = Math.abs(pv) > 0.001;
@@ -875,10 +901,14 @@
       if (l.opNote) html += '<div class="op-note"><span class="k">Operator note:</span> ' + escapeHtml(l.opNote) + '</div>';
 
       if (l.resolution) {
-        html += '<div class="resolution-summary"><span class="rlabel">' + resolutionLabel(l.resolution.type) + (l.resolution.type==='escalate' ? ' to the ' + l.resolution.to : '') +
-          (l.resolution.type === 'price_adjust' ? ' — ' + fmtMoney(l.confirmedPrice) + ' → ' + fmtMoney(l.resolution.newPrice) : '') +
-          (l.resolution.type === 'credit_note' ? ' — ' + fmtMoney(l.resolution.amount) + (l.resolution.ref ? ' (' + l.resolution.ref + ')' : ' (reference pending)') : '') +
-          ':</span><span class="rnote">' + escapeHtml(l.resolution.note) + ' — ' + l.resolution.actor + ', ' + l.resolution.ts + '</span></div>';
+        var r = l.resolution;
+        var rdetail = '';
+        if (r.type === 'settle_received') rdetail = ' — now ' + fmtQty(r.settledQty) + ' @ ' + fmtMoney(l.confirmedPrice) + ' = ' + fmtMoney(r.settledTotal);
+        else if (r.type === 'return_surplus') rdetail = ' — settled at confirmed ' + fmtQty(r.settledQty) + ' @ ' + fmtMoney(l.confirmedPrice) + ' = ' + fmtMoney(r.settledTotal);
+        else if (r.type === 'debit_credit') rdetail = ' — ' + fmtMoney(r.amount) + (r.ref ? ' (' + r.ref + ')' : ' (reference pending)');
+        else if (r.type === 'escalate') rdetail = ' to the ' + r.to;
+        html += '<div class="resolution-summary"><span class="rlabel">' + resolutionLabel(r) + rdetail +
+          ':</span><span class="rnote">' + escapeHtml(r.note) + ' — ' + r.actor + ', ' + r.ts + '</span></div>';
       } else if (lst === 'open' && !readOnly) {
         html += '<div class="line-actions"><button class="btn btn-primary btn-sm" data-resolve="' + g.id + '|' + l.id + '">Resolve this line</button></div>';
       } else if (lst === 'open' && readOnly) {
@@ -912,11 +942,12 @@
     var entries = [];
     g.lines.forEach(function(l){
       if (l.resolution) {
-        var head = l.item + ' — ' + resolutionLabel(l.resolution.type);
-        if (l.resolution.type === 'price_adjust') head += ' (' + fmtMoney(l.confirmedPrice) + ' → ' + fmtMoney(l.resolution.newPrice) + ')';
-        if (l.resolution.type === 'credit_note') head += ' (' + fmtMoney(l.resolution.amount) + ')';
-        if (l.resolution.type === 'escalate') head += ' → ' + l.resolution.to;
-        entries.push({ head: head, actor: l.resolution.actor, ts: l.resolution.ts, note: l.resolution.note, sortTs: l.resolution.ts });
+        var r = l.resolution;
+        var head = l.item + ' — ' + resolutionLabel(r);
+        if (r.type === 'settle_received' || r.type === 'return_surplus') head += ' (' + fmtMoney(r.settledTotal) + ')';
+        if (r.type === 'debit_credit') head += ' (' + fmtMoney(r.amount) + ')';
+        if (r.type === 'escalate') head += ' → ' + r.to;
+        entries.push({ head: head, actor: r.actor, ts: r.ts, note: r.note, sortTs: r.ts });
       }
     });
     entries.sort(function(a,b){ return new Date(b.sortTs) - new Date(a.sortTs); });
@@ -958,13 +989,13 @@
   var drawer = document.getElementById('drawer');
   var overlay = document.getElementById('overlay');
   var drawerCtx = null;
-  var drawerAction = 'accept';
+  var drawerAction = null;
 
   function openDrawer(grnId, lineId){
     var g = grns.find(function(x){ return x.id === grnId; });
     var l = g.lines.find(function(x){ return x.id === lineId; });
     drawerCtx = { grnId: grnId, lineId: lineId };
-    drawerAction = 'accept';
+    drawerAction = availableActions(l)[0];
     renderDrawer(g, l);
     drawer.classList.add('show');
     overlay.classList.add('show');
@@ -987,8 +1018,7 @@
       '</div>';
 
     html += '<div class="action-tabs">' +
-      tabBtn('accept', 'Accept as-is') + tabBtn('price_adjust', 'Adjust price') +
-      tabBtn('credit_note', 'Credit note') + tabBtn('escalate', 'Escalate') +
+      availableActions(l).map(function(a){ return tabBtn(a, actionLabel(a)); }).join('') +
       '</div>';
 
     html += '<div id="drawerFields"></div>';
@@ -1003,20 +1033,27 @@
 
   function renderDrawerFields(l){
     var el = document.getElementById('drawerFields');
-    var dv = Math.abs(dollarImpact(l));
     var html = '';
-    if (drawerAction === 'accept') {
-      html += field('Note (required)', '<textarea id="fNote" placeholder="Why is this acceptable as received?"></textarea>');
-    } else if (drawerAction === 'price_adjust') {
-      html += field('Corrected unit price', '<input type="number" id="fPrice" step="0.01" value="' + l.receivedPrice.toFixed(2) + '">', 'Confirmed was ' + fmtMoney(l.confirmedPrice) + ', received was ' + fmtMoney(l.receivedPrice) + '.');
-      html += field('Note (required)', '<textarea id="fNote" placeholder="What was agreed, and with whom?"></textarea>');
-    } else if (drawerAction === 'credit_note') {
-      html += field('Credit amount', '<input type="number" id="fAmount" step="0.01" value="' + dv.toFixed(2) + '">');
-      html += field('Credit note reference (optional)', '<input type="text" id="fRef" placeholder="Add once received from supplier">');
-      html += field('Note (required)', '<textarea id="fNote" placeholder="What\'s this credit for?"></textarea>');
+    if (drawerAction === 'settle_received') {
+      var settleTotal = l.receivedQty * l.confirmedPrice;
+      html += '<div class="field-recap"><div class="row"><span class="k">Settling at</span><span class="v">' + fmtQty(l.receivedQty) + ' @ ' + fmtMoney(l.confirmedPrice) + '</span></div>' +
+        '<div class="row"><span class="k">New line total</span><span class="v">' + fmtMoney(settleTotal) + '</span></div></div>';
+      html += field('Note (required)', '<textarea id="fNote" placeholder="Why settle at what was actually received?"></textarea>');
+    } else if (drawerAction === 'return_surplus') {
+      var returnTotal = l.confirmedQty * l.confirmedPrice;
+      html += '<div class="field-recap"><div class="row"><span class="k">Settling at</span><span class="v">' + fmtQty(l.confirmedQty) + ' @ ' + fmtMoney(l.confirmedPrice) + '</span></div>' +
+        '<div class="row"><span class="k">New line total</span><span class="v">' + fmtMoney(returnTotal) + '</span></div></div>';
+      html += field('Note (required)', '<textarea id="fNote" placeholder="Confirm the surplus pickup/return arrangement"></textarea>');
+    } else if (drawerAction === 'debit_credit') {
+      var suggested = dollarImpact(l);
+      var dir = suggested >= 0 ? 'credit' : 'debit';
+      var dirLabel = dir === 'credit' ? 'Credit' : 'Debit';
+      html += field(dirLabel + ' amount', '<input type="number" id="fAmount" step="0.01" value="' + Math.abs(suggested).toFixed(2) + '">',
+        dir === 'credit' ? 'Supplier owes this back to the business.' : 'Business owes this additional amount to the supplier.');
+      html += field(dirLabel + ' note reference (optional)', '<input type="text" id="fRef" placeholder="Add once received from supplier">');
+      html += field('Note (required)', '<textarea id="fNote" placeholder="What\'s this ' + dir + ' for?"></textarea>');
     } else if (drawerAction === 'escalate') {
-      var opts = reviewers.map(function(r){ return '<option value="' + r + '">' + r + '</option>'; }).join('');
-      html += field('Escalate to', '<select id="fTo">' + opts + '</select>');
+      html += '<p style="font-size:12.5px; color:var(--ink-soft); margin:0 0 14px;">This will be sent to the <strong>Accounts Manager</strong> for review.</p>';
       html += field('Note (required)', '<textarea id="fNote" placeholder="Why does this need another opinion?"></textarea>');
     }
     el.innerHTML = html;
@@ -1039,18 +1076,17 @@
     var ts = '2026-07-13 ' + (9 + Math.floor(Math.random()*8)) + ':' + (Math.random()<0.5?'15':'40');
     var actor = 'Procurement Lead';
 
-    if (drawerAction === 'accept') {
-      l.resolution = { type: 'accept', actor: actor, ts: ts, note: note };
-    } else if (drawerAction === 'price_adjust') {
-      var newPrice = parseFloat(document.getElementById('fPrice').value) || l.receivedPrice;
-      l.resolution = { type: 'price_adjust', actor: actor, ts: ts, note: note, newPrice: newPrice };
-    } else if (drawerAction === 'credit_note') {
+    if (drawerAction === 'settle_received') {
+      l.resolution = { type: 'settle_received', actor: actor, ts: ts, note: note, settledQty: l.receivedQty, settledTotal: l.receivedQty * l.confirmedPrice };
+    } else if (drawerAction === 'return_surplus') {
+      l.resolution = { type: 'return_surplus', actor: actor, ts: ts, note: note, settledQty: l.confirmedQty, settledTotal: l.confirmedQty * l.confirmedPrice };
+    } else if (drawerAction === 'debit_credit') {
       var amount = parseFloat(document.getElementById('fAmount').value) || 0;
       var ref = document.getElementById('fRef').value || '';
-      l.resolution = { type: 'credit_note', actor: actor, ts: ts, note: note, amount: amount, ref: ref };
+      var direction = dollarImpact(l) >= 0 ? 'credit' : 'debit';
+      l.resolution = { type: 'debit_credit', direction: direction, actor: actor, ts: ts, note: note, amount: amount, ref: ref };
     } else if (drawerAction === 'escalate') {
-      var to = document.getElementById('fTo').value;
-      l.resolution = { type: 'escalate', actor: actor, ts: ts, note: note, to: to };
+      l.resolution = { type: 'escalate', actor: actor, ts: ts, note: note, to: 'Accounts Manager' };
     }
 
     closeDrawer();
